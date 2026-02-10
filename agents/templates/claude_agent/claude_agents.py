@@ -447,10 +447,12 @@ class ClaudeCodeAgent(Agent):
             action.action_data.game_id = self.game_id
             
             if self.latest_reasoning:
+                action_label = tool_name.replace("mcp__arc-game-tools__", "")
+                thought_text = f"{action_label}\n\n{self.latest_reasoning}"
                 self.latest_reasoning_dict = {
-                    "thought": self.latest_reasoning[:16000]
+                    "thought": thought_text[:16000]
                 }
-                logger.info(f"Prepared reasoning for action ({len(self.latest_reasoning)} chars)")
+                logger.info(f"Prepared reasoning for action ({len(thought_text)} chars)")
             else:
                 self.latest_reasoning_dict = {}
                 logger.warning("No reasoning captured for action - reasoning logs will not appear in replay")
