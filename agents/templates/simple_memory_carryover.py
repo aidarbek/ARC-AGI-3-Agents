@@ -53,11 +53,11 @@ class SimpleMemoryCarryover(Agent):
     REASONING_EFFORT = "high"
 
     # Multimodal
-    USE_IMAGE_INPUT = True
+    USE_IMAGE_INPUT = False
     IMAGE_INPUT_SIZE = 512
 
     PARSE_FAILURE_CLEAR_THRESHOLD = 0
-    ENABLE_CHAT_LOG = True # Log to a readable .md file
+    ENABLE_CHAT_LOG = False # Log to a readable .md file
 
     TOOL_NAME = "submit_action_and_memory"
     # Prefer modern tool-calling by default; keep legacy function-calling fallback.
