@@ -3,6 +3,7 @@ import io
 import json
 import logging
 import os
+import re
 import textwrap
 import uuid
 from typing import Any
@@ -20,6 +21,7 @@ class SimpleMemoryCarryover(Agent):
 
     MAX_ACTIONS = 50
     ACTION_LABELS = {
+        "RESET": "RESET - Reset current level",
         "ACTION1": "ACTION1 - Up arrow key, W",
         "ACTION2": "ACTION2 - Down arrow key, S",
         "ACTION3": "ACTION3 - Left arrow key, A",
@@ -59,10 +61,6 @@ class SimpleMemoryCarryover(Agent):
     PARSE_FAILURE_CLEAR_THRESHOLD = 0
     ENABLE_CHAT_LOG = False # Log to a readable .md file
 
-    TOOL_NAME = "submit_action_and_memory"
-    # Prefer modern tool-calling by default; keep legacy function-calling fallback.
-    MODEL_REQUIRES_TOOLS = True
-
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
         if not api_key:
@@ -70,7 +68,6 @@ class SimpleMemoryCarryover(Agent):
         self.base_url = self.BASE_URL
         self.model = self.MODEL
         self.carryover_memory = ""
-        self._locked_available_actions: list[GameAction] | None = None
         self._pending_reasoning: dict[str, Any] | None = None
         self.consecutive_parse_failures = 0
         self.parse_failure_clear_threshold = self.PARSE_FAILURE_CLEAR_THRESHOLD
@@ -97,12 +94,10 @@ class SimpleMemoryCarryover(Agent):
         self, frames: list[FrameData], latest_frame: FrameData
     ) -> GameAction:
         available_actions = self._available_actions(latest_frame)
-        if self._locked_available_actions is None and available_actions:
-            # Game action set is constant; lock once to keep tool schema stable.
-            self._locked_available_actions = list(available_actions)
-        tool_actions = self._locked_available_actions or available_actions
         fallback_action = self._deterministic_fallback_action(latest_frame)
-        system_prompt = self._build_system_prompt(tool_actions)
+        system_prompt = self._build_system_prompt(
+            available_actions, latest_state=latest_frame.state
+        )
         user_prompt = self._build_user_prompt(latest_frame)
         response: Any | None = None
         request_payload: dict[str, Any] | None = None
@@ -119,16 +114,10 @@ class SimpleMemoryCarryover(Agent):
                 create_kwargs["extra_body"] = {
                     "reasoning": {"effort": self.REASONING_EFFORT}
                 }
-            if self.MODEL_REQUIRES_TOOLS:
-                create_kwargs["tools"] = self._build_tools(tool_actions)
-                create_kwargs["tool_choice"] = "required"
-            else:
-                create_kwargs["functions"] = self._build_functions(tool_actions)
-                create_kwargs["function_call"] = {"name": self.TOOL_NAME}
 
             request_payload = create_kwargs
             response = self.client.chat.completions.create(**create_kwargs)
-            args = self._extract_action_and_memory_arguments(response)
+            args = self._extract_action_and_memory_from_response(response)
 
             action, action_note = self._action_from_arguments(
                 args=args,
@@ -218,18 +207,29 @@ class SimpleMemoryCarryover(Agent):
             )
             return action
 
-    def _build_system_prompt(self, available_actions: list[GameAction]) -> str:
+    def _build_system_prompt(
+        self, available_actions: list[GameAction], latest_state: GameState
+    ) -> str:
         available_names = [action.name for action in available_actions]
         available_actions_inline = ", ".join(available_names) or "<none>"
         action_meanings = self._available_action_meanings(available_actions)
         action6_available = GameAction.ACTION6 in available_actions
+        game_state = latest_state.name if isinstance(latest_state, GameState) else str(latest_state)
+        game_state_rule = (
+            "- Current state is GAME_OVER. The previous run is lost.\n"
+            "- In GAME_OVER, RESET is the only allowed action.\n"
+            if latest_state is GameState.GAME_OVER
+            else ""
+        )
         action6_rule = ""
-        action6_output_rule = ""
+        action6_format_rule = ""
         if action6_available:
             action6_rule = (
                 "- If you choose ACTION6, you must also provide integer x and y in [0,63].\n"
             )
-            action6_output_rule = "- x and y are required when action_name is ACTION6\n"
+            action6_format_rule = (
+                "- For ACTION6, provide coordinates as `<action>ACTION6 x=<int> y=<int></action>`\n"
+            )
         return textwrap.dedent(
             """
 You are a turn-based game-playing agent. Your task is to analyze the current game state, choose an appropriate action, and manage your memory effectively across turns.
@@ -238,9 +238,9 @@ You are a turn-based game-playing agent. Your task is to analyze the current gam
 
 You do NOT have persistent hidden memory. Your memory works as follows:
 - You only have access to information explicitly provided in MEMORY_FROM_PREVIOUS_TURN
-- When you write memory_for_next_turn, it COMPLETELY REPLACES all previous memory
+- When you write `<memory>...</memory>`, it COMPLETELY REPLACES all previous memory
 - If you need to compare the current state to a previous state, you must have stored the relevant previous state information in your memory during the last turn
-- Any information not included in your memory_for_next_turn output will be permanently lost
+- Any information not included in your `<memory>` output will be permanently lost
 
 ## Your Task
 
@@ -255,6 +255,8 @@ You do NOT have persistent hidden memory. Your memory works as follows:
 Choose exactly ONE action from ({available_actions_inline}).
 Available action meanings:
 {action_meanings}
+Current game state: {game_state}
+{game_state_rule}
 {action6_rule}
 ## Instructions for Your Response
 
@@ -263,20 +265,30 @@ Before making your final decision, work through your reasoning in <game_analysis
 1. Current State Understanding: Parse the frames data and note key observations.
 2. Context Review: Review the information you stored in memory from the previous turn.
 3. State Comparison: If memory contains previous-state information, identify what changed and what stayed the same.
-4. Memory Planning: Decide what to keep, discard, and add to memory_for_next_turn.
+4. Memory Planning: Decide what to keep, discard, and add to your next-turn `<memory>`.
 5. Action Selection: Choose the single most appropriate action.
 
-Call submit_action_and_memory exactly once with action_name and memory_for_next_turn.
-- Use this function call as your final output.
-- action_name: one of ({available_actions_inline})
-- memory_for_next_turn: all information you want to persist to your next turn
-{action6_output_rule}
-Do not output pseudo-code or plain text action descriptions.
+Your final output must be plain text containing exactly:
+1) one <action>...</action> block
+2) one <memory>...</memory> block
+
+Formatting rules:
+- For simple actions, use `<action>ACTION_NAME</action>` where ACTION_NAME is one of ({available_actions_inline})
+- For reset, use `<action>RESET</action>`
+{action6_format_rule}
+- Put all carryover memory in `<memory>...</memory>` (this fully replaces previous memory)
+- Do not use tool calls or function calls
+- Do not output pseudo-code or plain text action descriptions outside these tags
+
+Hint: 
+You are currently playing with hints enabled. For the current game, the objective is to flip tiles to match constraint tiles. Constraint tiles have a special design of having 0 and 2 pixels, and their center defines which color it applies constraints on. For example, if it is 8, the 0 pixels around it show in which immediate locations there must be 8 tiles. non 0 values mean the center color is NOT in that location, so not 8 for this example.
             """.format(
                 available_actions_inline=available_actions_inline,
                 action_meanings=action_meanings,
+                game_state=game_state,
+                game_state_rule=game_state_rule,
                 action6_rule=action6_rule,
-                action6_output_rule=action6_output_rule,
+                action6_format_rule=action6_format_rule,
             )
         ).strip()
 
@@ -320,67 +332,8 @@ MEMORY_FROM_PREVIOUS_TURN:
             )
         ).strip()
 
-    def _build_tools(self, available_actions: list[GameAction]) -> list[dict[str, Any]]:
-        action_enum = self._tool_action_enum(available_actions)
-        action6_available = GameAction.ACTION6 in available_actions
-        action_desc = "One selected action from AVAILABLE_ACTIONS."
-        properties: dict[str, Any] = {
-            "action_name": {
-                "type": "string",
-                "enum": action_enum,
-                "description": action_desc,
-            },
-            "memory_for_next_turn": {
-                "type": "string",
-                "description": "All memory text to persist to the next turn.",
-            },
-        }
-        if action6_available:
-            properties["x"] = {
-                "type": "integer",
-                "minimum": 0,
-                "maximum": 63,
-                "description": "Required only for ACTION6.",
-            }
-            properties["y"] = {
-                "type": "integer",
-                "minimum": 0,
-                "maximum": 63,
-                "description": "Required only for ACTION6.",
-            }
-        return [
-            {
-                "type": "function",
-                "function": {
-                    "name": self.TOOL_NAME,
-                    "description": "Submit the next action and the full memory to persist to next turn.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": properties,
-                        "required": ["action_name", "memory_for_next_turn"],
-                        "additionalProperties": False,
-                    },
-                },
-            }
-        ]
-
-    def _build_functions(self, available_actions: list[GameAction]) -> list[dict[str, Any]]:
-        tools = self._build_tools(available_actions)
-        return [tools[0]["function"]]
-
-    def _action_token_for_tool(self, action: GameAction) -> str:
-        return action.name
-
-    def _tool_action_enum(self, available_actions: list[GameAction]) -> list[str]:
-        tokens: list[str] = []
-        for action in available_actions:
-            token = self._action_token_for_tool(action)
-            if token not in tokens:
-                tokens.append(token)
-        return tokens
-
     def _parse_action_token(self, action_token: str) -> GameAction:
-        token = action_token.strip()
+        token = action_token.strip().upper()
         if not token:
             raise ValueError("missing action_name")
         return GameAction.from_name(token)
@@ -398,42 +351,90 @@ MEMORY_FROM_PREVIOUS_TURN:
             return "- <none>"
         return "\n".join(lines)
 
-    def _extract_tool_arguments(self, response: Any) -> dict[str, Any]:
+    def _extract_action_and_memory_from_response(self, response: Any) -> dict[str, Any]:
+        response_text = self._extract_response_text(response)
+        action_text = self._extract_tag_content(response_text, "action")
+        memory_text = self._extract_tag_content(response_text, "memory")
+        args = self._parse_action_text(action_text)
+        args["memory_for_next_turn"] = memory_text
+        return args
+
+    def _extract_response_text(self, response: Any) -> str:
         if not response.choices:
             raise ValueError("No choices returned from model.")
         message = response.choices[0].message
-        tool_calls = message.tool_calls or []
-        if len(tool_calls) == 0:
-            raise ValueError("Model did not call a tool.")
-        tool_call = tool_calls[0]
-        if tool_call.function.name != self.TOOL_NAME:
-            raise ValueError(f"Unexpected tool name: {tool_call.function.name}")
-        raw_arguments = tool_call.function.arguments or "{}"
-        parsed = json.loads(raw_arguments)
-        if not isinstance(parsed, dict):
-            raise ValueError("Tool arguments were not a JSON object.")
-        return parsed
+        content = getattr(message, "content", None)
+        if content is None:
+            raise ValueError("Model response content was empty.")
 
-    def _extract_function_arguments(self, response: Any) -> dict[str, Any]:
-        if not response.choices:
-            raise ValueError("No choices returned from model.")
-        message = response.choices[0].message
-        function_call = getattr(message, "function_call", None)
-        if function_call is None:
-            raise ValueError("Model did not call a function.")
-        function_name = getattr(function_call, "name", None)
-        if function_name != self.TOOL_NAME:
-            raise ValueError(f"Unexpected function name: {function_name}")
-        raw_arguments = getattr(function_call, "arguments", None) or "{}"
-        parsed = json.loads(raw_arguments)
-        if not isinstance(parsed, dict):
-            raise ValueError("Function arguments were not a JSON object.")
-        return parsed
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                item_text: str | None = None
+                if isinstance(item, dict):
+                    if item.get("type") == "text":
+                        raw_text = item.get("text")
+                        item_text = str(raw_text) if raw_text is not None else None
+                    elif item.get("text") is not None:
+                        item_text = str(item.get("text"))
+                else:
+                    raw_text = getattr(item, "text", None)
+                    if raw_text is not None:
+                        item_text = str(raw_text)
+                if item_text:
+                    parts.append(item_text)
+            text = "\n".join(parts)
+        else:
+            text = str(content)
 
-    def _extract_action_and_memory_arguments(self, response: Any) -> dict[str, Any]:
-        if self.MODEL_REQUIRES_TOOLS:
-            return self._extract_tool_arguments(response)
-        return self._extract_function_arguments(response)
+        text = text.strip()
+        if not text:
+            raise ValueError("Model response text was empty.")
+        return text
+
+    def _extract_tag_content(self, response_text: str, tag_name: str) -> str:
+        pattern = re.compile(
+            rf"<{tag_name}>(.*?)</{tag_name}>",
+            re.IGNORECASE | re.DOTALL,
+        )
+        matches = pattern.findall(response_text)
+        if not matches:
+            raise ValueError(f"Missing <{tag_name}>...</{tag_name}> block in model output.")
+        return matches[-1].strip()
+
+    def _parse_action_text(self, action_text: str) -> dict[str, Any]:
+        payload = action_text.strip()
+        if not payload:
+            raise ValueError("empty <action> tag")
+
+        if payload.startswith("{"):
+            parsed = json.loads(payload)
+            if not isinstance(parsed, dict):
+                raise ValueError("<action> JSON must decode to an object.")
+            return parsed
+
+        action_match = re.search(r"\b(ACTION[1-7]|RESET)\b", payload, re.IGNORECASE)
+        if action_match is None:
+            raise ValueError(f"Could not parse action name from <action>: {payload!r}")
+        action_name = action_match.group(1).upper()
+        parsed_action: dict[str, Any] = {"action_name": action_name}
+
+        x_match = re.search(r"\bx\s*[:=]\s*(-?\d+)", payload, re.IGNORECASE)
+        y_match = re.search(r"\by\s*[:=]\s*(-?\d+)", payload, re.IGNORECASE)
+        if x_match is not None and y_match is not None:
+            parsed_action["x"] = int(x_match.group(1))
+            parsed_action["y"] = int(y_match.group(1))
+            return parsed_action
+
+        if action_name == GameAction.ACTION6.name:
+            remainder = payload[action_match.end() :]
+            coords = re.findall(r"-?\d+", remainder)
+            if len(coords) >= 2:
+                parsed_action["x"] = int(coords[0])
+                parsed_action["y"] = int(coords[1])
+        return parsed_action
 
     def _extract_memory(self, args: dict[str, Any]) -> str:
         memory = args.get("memory_for_next_turn", "")
@@ -448,7 +449,9 @@ MEMORY_FROM_PREVIOUS_TURN:
         fallback_action: GameAction,
         available_actions: list[GameAction],
     ) -> tuple[GameAction, str]:
-        action_name = str(args.get("action_name", args.get("action", ""))).strip()
+        action_name = str(
+            args.get("action_name", args.get("action", args.get("name", "")))
+        ).strip()
         try:
             requested_action = self._parse_action_token(action_name)
         except ValueError:
@@ -544,6 +547,7 @@ MEMORY_FROM_PREVIOUS_TURN:
             "memory_chars": len(memory_after),
             # This is what the ARC site displays under Reasoning Log.
             "assistant_response": self._conversation_response_payload(response),
+            "parsed_output": parsed_args,
             "tool_args": parsed_args,
         }
         if error is not None:
@@ -555,12 +559,16 @@ MEMORY_FROM_PREVIOUS_TURN:
         return payload
 
     def _available_actions(self, latest_frame: FrameData) -> list[GameAction]:
+        if latest_frame.state is GameState.GAME_OVER:
+            return [GameAction.RESET]
         raw_actions = getattr(latest_frame, "available_actions", None) or []
         parsed: list[GameAction] = []
         for raw in raw_actions:
             action = self._coerce_action(raw)
             if action is not None:
                 parsed.append(action)
+        if GameAction.RESET not in parsed:
+            parsed.append(GameAction.RESET)
         return parsed
 
     def _deterministic_fallback_action(self, latest_frame: FrameData) -> GameAction:
@@ -706,7 +714,7 @@ MEMORY_FROM_PREVIOUS_TURN:
             json.dumps(response_payload, ensure_ascii=True, indent=2),
             "```",
             "",
-            "### Parsed Tool Arguments (Derived)",
+            "### Parsed Output (Derived)",
             "```json",
             json.dumps(parsed_args, ensure_ascii=True, indent=2),
             "```",
