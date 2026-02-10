@@ -565,27 +565,29 @@ MEMORY_FROM_PREVIOUS_TURN:
 
     def _deterministic_fallback_action(self, latest_frame: FrameData) -> GameAction:
         available_actions = self._available_actions(latest_frame)
-        if (
-            latest_frame.state in (GameState.NOT_PLAYED, GameState.GAME_OVER)
-            and GameAction.RESET in available_actions
-        ):
-            return GameAction.RESET
-        for action in available_actions:
+        non_reset_actions = [a for a in available_actions if a != GameAction.RESET]
+
+        # Prefer any non-reset simple action first.
+        for action in non_reset_actions:
             if action.is_simple():
                 return action
-        if available_actions:
-            # If only complex actions are available, use deterministic coordinates.
-            action = available_actions[0]
+
+        # If only non-reset complex actions exist, use deterministic coordinates.
+        for action in non_reset_actions:
             if action.is_complex():
                 action.set_data({"x": 0, "y": 0})
-            return action
+                return action
+
+        # RESET is a last resort only when no other action exists.
+        if GameAction.RESET in available_actions:
+            return GameAction.RESET
         return GameAction.RESET
 
     def _fallback_non_complex_action(
         self, latest_frame: FrameData, available_actions: list[GameAction]
     ) -> GameAction:
         for action in available_actions:
-            if action.is_simple():
+            if action != GameAction.RESET and action.is_simple():
                 return action
         return self._deterministic_fallback_action(latest_frame)
 
