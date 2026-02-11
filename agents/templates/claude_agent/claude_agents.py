@@ -135,20 +135,29 @@ class ClaudeCodeAgent(Agent):
             available_tools_str = "ERROR determining available actions"
             logger.error(f"Failed to format available actions: {e}")
 
-        # Build animation history from all previous frames that have grid data
-        history_frames = [(i, f) for i, f in enumerate(frames) if f.frame and len(f.frame) > 0]
+        # Show animation frames from the latest API response only (not cumulative history).
+        # Each step() returns a single FrameData whose .frame may contain multiple layers
+        # (e.g. 3 frames for an animation). Show all layers from this response.
+        MAX_ANIMATION_FRAMES = 7
         animation_section = ""
-        if history_frames:
+        if latest_frame.frame and len(latest_frame.frame) > 1:
+            total_layers = len(latest_frame.frame)
+            layers_to_show = latest_frame.frame[-MAX_ANIMATION_FRAMES:]
+            skipped = total_layers - len(layers_to_show)
             parts = []
-            for idx, (_, f) in enumerate(history_frames):
-                g = self._format_grid(f)
-                if g:
-                    parts.append(f"--- Frame {idx + 1} (State: {f.state.value}, Levels: {f.levels_completed}) ---\n{g}")
+            for idx, layer in enumerate(layers_to_show):
+                frame_num = skipped + idx + 1
+                grid = "\n".join(
+                    [" ".join([str(cell).rjust(2) for cell in row]) for row in layer]
+                )
+                if grid:
+                    parts.append(f"--- Animation Frame {frame_num} of {total_layers} ---\n{grid}")
             if parts:
+                truncation_note = f"\n(Showing last {len(layers_to_show)} of {total_layers} frames)\n" if skipped > 0 else ""
                 animation_section = (
-                    "\n\nAnimation History (all previous frames received, in order):\n"
+                    f"\n\nAnimation Frames (from latest action response):{truncation_note}\n"
                     + "\n\n".join(parts)
-                    + "\n\n--- End of Animation History ---"
+                    + "\n\n--- End of Animation Frames ---"
                 )
 
         prompt = textwrap.dedent(f"""
@@ -161,6 +170,11 @@ class ClaudeCodeAgent(Agent):
 
             Current Grid (64x64, values 0-15):
             {grid_str}
+
+            Note: Some actions trigger animations that return multiple frames. When this
+            happens, the animation frames are shown above. If an animation has more than
+            {MAX_ANIMATION_FRAMES} frames, only the last {MAX_ANIMATION_FRAMES} are shown.
+            The Current Grid always reflects the final state.
 
             Available game action tools (only these are valid this turn):
             {available_tools_str}
