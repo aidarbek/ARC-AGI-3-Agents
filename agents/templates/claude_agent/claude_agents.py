@@ -113,6 +113,8 @@ class ClaudeCodeAgent(Agent):
         logging.getLogger("anthropic").setLevel(logging.CRITICAL)
         logging.getLogger("httpx").setLevel(logging.CRITICAL)
 
+        self._auto_reset_from_game_over = False
+
         # Persistent async infrastructure — single Claude Code subprocess for all turns
         self._loop = asyncio.new_event_loop()
         self._client: Optional[ClaudeSDKClient] = None
@@ -265,6 +267,13 @@ class ClaudeCodeAgent(Agent):
 
     def _build_previous_action_section(self, frames: list[FrameData]) -> str:
         """Build the section describing the previous action and its effect on the grid."""
+        if self._auto_reset_from_game_over:
+            self._auto_reset_from_game_over = False
+            return (
+                "\nThe previous level ended in GAME_OVER. "
+                "The game has been automatically reset. Study the new grid carefully."
+            )
+
         if not self.previous_action_info:
             return ""
 
@@ -481,11 +490,20 @@ class ClaudeCodeAgent(Agent):
     ) -> GameAction:
         self.step_counter += 1
         logger.info(f"Step {self.step_counter}: Choosing action...")
-        
+
         if self.consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
             logger.error(f"FATAL: {self.consecutive_errors} consecutive errors, stopping agent")
             raise RuntimeError(f"Too many consecutive errors ({self.consecutive_errors}), cannot continue")
-        
+
+        # Auto-reset on GAME_OVER without querying Claude (mirrors random agent behavior)
+        if latest_frame.state is GameState.GAME_OVER:
+            logger.info(f"GAME_OVER detected — auto-resetting (step {self.step_counter})")
+            action = GameAction.RESET
+            action.reasoning = "Auto-reset: game over state detected"
+            self.previous_action_info = self._build_action_info(action)
+            self._auto_reset_from_game_over = True
+            return action
+
         self.current_frame = latest_frame
         self.latest_reasoning = ""
         self.latest_reasoning_dict = {}
