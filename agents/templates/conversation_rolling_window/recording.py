@@ -75,7 +75,8 @@ class StepRecord(BaseModel):
     duration_seconds: float = 0.0
     model: str
     messages_sent: list[dict[str, Any]]
-    assistant_response: str
+    assistant_response: str | None = None
+    reasoning: str | None = None
     parsed_action: str | dict[str, Any]
     usage: StepUsage = Field(default_factory=StepUsage)
     retries: int = 0

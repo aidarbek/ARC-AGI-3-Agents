@@ -13,7 +13,7 @@
 .vscode/
 
 # Recordings
-recordings/*.recording.jsonl
+recordings/
 tests/recordings/*.recording.jsonl
 tests/recordings/not-a-recording.txt
 

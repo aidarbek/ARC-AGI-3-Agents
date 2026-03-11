@@ -7,19 +7,16 @@ import textwrap
 import time
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
-import openai
+import yaml
 from arcengine import FrameData, GameAction, GameState
 from openai import OpenAI as OpenAIClient
 
 from ...agent import Agent
+from .exceptions import EmptyResponseError
 from .recording import RunRecord, StepRecord, StepUsage
-
-
-class EmptyResponseError(Exception):
-    """Raised when the API returns HTTP 200 but with null/empty choices."""
-
 
 logger = logging.getLogger()
 
@@ -32,23 +29,31 @@ class ConversationRollingWindow(Agent):
     turns are trimmed from the front of the conversation.
     """
 
-    MAX_ACTIONS: int = 20
+    MODEL_CONFIG_ID: str = "gpt-5.4-openrouter"
+    MAX_ACTIONS: int = 60
     MAX_RETRIES: int = 3
-    MAX_CONTEXT_LENGTH: int = 175000
-    MODEL: str = "openai/gpt-5.2"
-    ANIMATION_FRAME_COUNT: int = 3
+    MAX_CONTEXT_LENGTH: int = 180000
+    MAX_ANIMATION_FRAMES: int = 7
     REASONING_EFFORT: Optional[str] = None
     # Empirically, rendered ARC grid payloads are close to 1 char per token.
     # Using 1.0 is intentionally conservative relative to observed runs.
     ESTIMATED_CHARS_PER_TOKEN: float = 1.0
 
+    # Defaults used when the YAML entry is missing base_url / api_key_env
+    _DEFAULT_BASE_URL: str = "https://openrouter.ai/api/v1"
+    _DEFAULT_API_KEY_ENV: str = "OPENROUTER_API_KEY"
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.conversation: list[dict[str, Any]] = []
         self.token_counter: int = 0
+        model_cfg = self._load_model_config()
+        self.MODEL: str = model_cfg["model"]
+        base_url = model_cfg.get("base_url", self._DEFAULT_BASE_URL)
+        api_key_env = model_cfg.get("api_key_env", self._DEFAULT_API_KEY_ENV)
         self._client = OpenAIClient(
-            base_url="https://openrouter.ai/api/v1",
-            api_key=os.environ.get("OPENROUTER_API_KEY", ""),
+            base_url=base_url,
+            api_key=os.environ.get(api_key_env, ""),
         )
         # Per-step recording
         self.step_counter: int = 0
@@ -65,16 +70,38 @@ class ConversationRollingWindow(Agent):
         )
         self._write_run_meta()
 
+    def _load_model_config(self) -> dict[str, Any]:
+        """Load the ``api`` section from model_configs.yaml matching MODEL_CONFIG_ID.
+
+        Raises ``ValueError`` if the YAML file is missing or no entry with a
+        matching ``name`` is found.
+        """
+        cfg_path = Path(__file__).parent / "model_configs.yaml"
+        if not cfg_path.exists():
+            raise ValueError(
+                f"model_configs.yaml not found at {cfg_path}. "
+                f"Cannot resolve MODEL_CONFIG_ID={self.MODEL_CONFIG_ID!r}."
+            )
+        configs = yaml.safe_load(cfg_path.read_text()) or []
+        for entry in configs:
+            if entry.get("name") == self.MODEL_CONFIG_ID:
+                return dict(entry.get("api", {}))
+        available = [e.get("name") for e in configs]
+        raise ValueError(
+            f"Model config {self.MODEL_CONFIG_ID!r} not found in {cfg_path}. "
+            f"Available configs: {available}"
+        )
+
     @property
     def name(self) -> str:
-        sanitized = self.MODEL.replace("/", "-").replace(":", "-")
-        return f"{super().name}.{sanitized}.anim{self.ANIMATION_FRAME_COUNT}"
+        sanitized = self.MODEL_CONFIG_ID.replace("/", "-").replace(":", "-")
+        return f"{super().name}.{sanitized}.anim{self.MAX_ANIMATION_FRAMES}"
 
     # ── Prompts ──────────────────────────────────────────────────────────
 
     def _build_system_prompt(self) -> str:
         return textwrap.dedent("""\
-            You are playing a game. Win in as few actions as possible. Reply with the exact action you choose.
+            You are playing a game. Your goal is to win in as few actions as possible. Reply with the exact action you choose. Any notes you make will be carried over to the next turn.
         """)
 
     def _get_actions(self, latest_frame: FrameData) -> list[GameAction]:
@@ -96,7 +123,7 @@ class ConversationRollingWindow(Agent):
         self, frame_grids: list[list[list[int]]]
     ) -> list[list[list[int]]]:
         n = len(frame_grids)
-        target = self.ANIMATION_FRAME_COUNT
+        target = self.MAX_ANIMATION_FRAMES
         if n <= target:
             return frame_grids
         if target == 1:
@@ -105,24 +132,21 @@ class ConversationRollingWindow(Agent):
         return [frame_grids[i] for i in indices]
 
     def build_frame_content(self, latest_frame: FrameData) -> str:
-        grids = self.interpolate_frames(latest_frame.frame)
+        frames = self.interpolate_frames(latest_frame.frame)
 
         parts = [
             f"State: {latest_frame.state.name}\n"
-            f"Levels completed: {latest_frame.levels_completed}\n"
-            f"Grids: {len(grids)} of {len(latest_frame.frame)} animation frames",
+            f"Levels completed: {latest_frame.levels_completed}",
         ]
 
-        for i, grid in enumerate(grids):
-            grid_text = f"Grid {i}:\n" + "\n".join(f"  {row}" for row in grid)
-            parts.append(grid_text)
+        for i, frame in enumerate(frames):
+            frame_text = f"Frame {i}:\n" + "\n".join(f"  {row}" for row in frame)
+            parts.append(frame_text)
 
         actions_text = self._build_available_actions_text(
             self._get_actions(latest_frame)
         )
-        parts.append(
-            f"Available actions:\n{actions_text}\n\nChoose exactly one action."
-        )
+        parts.append(f"Available actions:\n{actions_text}")
 
         return "\n\n".join(parts)
 
@@ -140,8 +164,16 @@ class ConversationRollingWindow(Agent):
                 pattern = rf"{action.name}\s*[:(]?\s*(\d+)\s*[,\s]\s*(\d+)\s*\)?"
                 for match in re.finditer(pattern, text_upper):
                     a = GameAction.from_name(action.name)
-                    x = max(0, min(int(match.group(1)), 63))
-                    y = max(0, min(int(match.group(2)), 63))
+                    x = int(match.group(1))
+                    y = int(match.group(2))
+                    if not (0 <= x <= 63 and 0 <= y <= 63):
+                        logger.warning(
+                            "Ignoring out-of-bounds coordinates for %s: (%s, %s)",
+                            action.name,
+                            x,
+                            y,
+                        )
+                        continue
                     a.set_data({"x": x, "y": y})
                     candidates.append((match.start(), a))
             else:
@@ -165,7 +197,7 @@ class ConversationRollingWindow(Agent):
     def _format_parsed_action(action: GameAction) -> str | dict[str, Any]:
         """Format a parsed action for recording. Complex actions include coordinates."""
         if action.is_complex():
-            return {"action": action.name, **action.data}
+            return {"action": action.name, **action.action_data.model_dump()}
         return str(action.name)
 
     def _write_run_meta(self) -> None:
@@ -202,6 +234,14 @@ class ConversationRollingWindow(Agent):
         self._write_run_meta()
         logger.info(f"Saved step {self.step_counter} to {filename}")
 
+    # ── Action submission ──────────────────────────────────────────────
+
+    def do_action_request(self, action: GameAction) -> FrameData:
+        data = action.action_data.model_dump()
+        reasoning = getattr(action, "reasoning", {}) or {}
+        raw = self.arc_env.step(action, data=data, reasoning=reasoning)
+        return self._convert_raw_frame_data(raw)
+
     # ── Core loop ────────────────────────────────────────────────────────
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
@@ -210,47 +250,25 @@ class ConversationRollingWindow(Agent):
     def choose_action(
         self, frames: list[FrameData], latest_frame: FrameData
     ) -> GameAction:
-        # Bootstrap: first call sends RESET without an API call
-        if not self.conversation:
-            self.conversation.append(
-                {"role": "system", "content": self._build_system_prompt()}
-            )
-            self.conversation.append(
-                {"role": "assistant", "content": "RESET - Starting the game."}
-            )
+        # Reset whenever the environment indicates the game is not currently playable.
+        if latest_frame.state in (GameState.NOT_PLAYED, GameState.GAME_OVER):
             self._save_step(
                 StepRecord(
                     step=self.step_counter + 1,
                     timestamp=datetime.now(timezone.utc),
                     duration_seconds=0.0,
                     model=self.MODEL,
-                    messages_sent=list(self.conversation),
-                    assistant_response="RESET - Starting the game.",
+                    messages_sent=[],
                     parsed_action="RESET",
                 )
             )
             return GameAction.RESET
 
-        # Handle NOT_PLAYED / GAME_OVER states that need a RESET
-        if latest_frame.state in (GameState.NOT_PLAYED, GameState.GAME_OVER):
+        # Ensure the system prompt is present before the first real turn
+        if not self.conversation:
             self.conversation.append(
-                {"role": "user", "content": f"State: {latest_frame.state.name}"}
+                {"role": "system", "content": self._build_system_prompt()}
             )
-            self.conversation.append(
-                {"role": "assistant", "content": "RESET - Restarting the game."}
-            )
-            self._save_step(
-                StepRecord(
-                    step=self.step_counter + 1,
-                    timestamp=datetime.now(timezone.utc),
-                    duration_seconds=0.0,
-                    model=self.MODEL,
-                    messages_sent=list(self.conversation),
-                    assistant_response="RESET - Restarting the game.",
-                    parsed_action="RESET",
-                )
-            )
-            return GameAction.RESET
 
         # Normal turn: append frame, call the model, parse action
         self.conversation.append(
@@ -258,80 +276,44 @@ class ConversationRollingWindow(Agent):
         )
 
         actions = self._get_actions(latest_frame)
-        assistant_text = ""
-        step_usage = StepUsage()
-        empty_response_count = 0
         start = time.monotonic()
-        for attempt in range(self.MAX_RETRIES + 1):
-            try:
-                response = self._call_with_overflow_handling()
-            except EmptyResponseError:
-                empty_response_count += 1
-                logger.warning(
-                    f"Empty API response "
-                    f"(attempt {attempt + 1}/{self.MAX_RETRIES + 1})."
-                )
-                continue
-
-            step_usage = step_usage + StepUsage.from_response(response)
-            assistant_text = response.choices[0].message.content or ""
-            logger.info(f"Assistant response: {assistant_text[:200]}")
-
-            action = self._parse_action(assistant_text, actions)
-            if action is not None:
-                self.conversation.append(
-                    {"role": "assistant", "content": assistant_text}
-                )
-                logger.info(f"Parsed action: {self._format_parsed_action(action)}")
-                duration = time.monotonic() - start
-                self._save_step(
-                    StepRecord(
-                        step=self.step_counter + 1,
-                        timestamp=datetime.now(timezone.utc),
-                        duration_seconds=round(duration, 3),
-                        model=self.MODEL,
-                        messages_sent=list(self.conversation),
-                        assistant_response=assistant_text,
-                        parsed_action=self._format_parsed_action(action),
-                        usage=step_usage,
-                        retries=attempt,
-                    )
-                )
-                return action
-
-            logger.warning(
-                f"No action found in response "
-                f"(attempt {attempt + 1}/{self.MAX_RETRIES + 1}). Retrying."
-            )
-
-        # All attempts returned empty responses — no fallback, propagate the error
-        if empty_response_count == self.MAX_RETRIES + 1:
-            raise EmptyResponseError(
-                f"All {self.MAX_RETRIES + 1} attempts returned empty API responses. "
-                f"Diagnostics saved to {self.run_dir}"
-            )
-
-        # Exhausted retries due to parse failures — fall back
-        self.conversation.append({"role": "assistant", "content": assistant_text})
-        logger.error(
-            f"Failed to parse action after {self.MAX_RETRIES + 1} attempts. "
-            "Defaulting to ACTION5."
+        assistant_text, reasoning, action, step_usage, retries = (
+            self._request_with_retries(actions)
         )
-        duration = time.monotonic() - start
+        duration = round(time.monotonic() - start, 3)
+
+        # Build conversation message: include reasoning if present
+        if reasoning:
+            conversation_text = (
+                f"<reasoning>\n{reasoning}\n</reasoning>\n\n{assistant_text}"
+            )
+        else:
+            conversation_text = assistant_text
+        self.conversation.append({"role": "assistant", "content": conversation_text})
+
+        logger.info(f"Parsed action: {self._format_parsed_action(action)}")
         self._save_step(
             StepRecord(
                 step=self.step_counter + 1,
                 timestamp=datetime.now(timezone.utc),
-                duration_seconds=round(duration, 3),
+                duration_seconds=duration,
                 model=self.MODEL,
                 messages_sent=list(self.conversation),
                 assistant_response=assistant_text,
-                parsed_action="ACTION5 (fallback)",
+                reasoning=reasoning,
+                parsed_action=self._format_parsed_action(action),
                 usage=step_usage,
-                retries=self.MAX_RETRIES + 1,
+                retries=retries,
             )
         )
-        return GameAction.ACTION5
+
+        # Pass reasoning to the action for submission to the ARC environment
+        if reasoning:
+            action.reasoning = {"response": f"{assistant_text}\n\n{reasoning}"}
+        else:
+            action.reasoning = {"response": assistant_text}
+
+        return action
 
     # ── Token estimation & proactive trimming ─────────────────────────
 
@@ -357,53 +339,72 @@ class ConversationRollingWindow(Agent):
                 f"{len(self.conversation)} messages remaining."
             )
 
-    # ── OpenAI call with context-overflow trimming ───────────────────────
+    # ── API calls & retries ────────────────────────────────────────────
 
-    def _call_with_overflow_handling(self) -> Any:
+    def _request_with_retries(
+        self, actions: list[GameAction]
+    ) -> tuple[str, str | None, GameAction, StepUsage, int]:
+        """Call the API with retries. Returns (assistant_text, reasoning, action, usage, retries)."""
+        step_usage = StepUsage()
+        for attempt in range(self.MAX_RETRIES + 1):
+            try:
+                response = self._call_api()
+            except EmptyResponseError:
+                logger.warning(
+                    f"Empty API response "
+                    f"(attempt {attempt + 1}/{self.MAX_RETRIES + 1})."
+                )
+                continue
+            except Exception as e:
+                logger.warning(
+                    f"API error: {type(e).__name__}: {e} "
+                    f"(attempt {attempt + 1}/{self.MAX_RETRIES + 1})."
+                )
+                continue
+
+            step_usage = step_usage + StepUsage.from_response(response)
+            msg = response.choices[0].message
+            assistant_text = msg.content or ""
+            reasoning = getattr(msg, "reasoning", None) or getattr(
+                msg, "reasoning_content", None
+            )
+            logger.info(f"Assistant response: {assistant_text[:200]}")
+
+            action = self._parse_action(assistant_text, actions)
+            if action is not None:
+                return assistant_text, reasoning, action, step_usage, attempt
+
+            logger.warning(
+                f"Could not parse action from response "
+                f"(attempt {attempt + 1}/{self.MAX_RETRIES + 1})."
+            )
+
+        raise RuntimeError(
+            f"Failed to get a valid action after {self.MAX_RETRIES + 1} attempts."
+        )
+
+    def _call_api(self) -> Any:
         self._trim_to_fit_context()
 
-        while True:
-            create_kwargs: dict[str, Any] = {
-                "model": self.MODEL,
-                "messages": self.conversation,
-            }
-            if self.REASONING_EFFORT is not None:
-                create_kwargs["reasoning_effort"] = self.REASONING_EFFORT
+        create_kwargs: dict[str, Any] = {
+            "model": self.MODEL,
+            "messages": self.conversation,
+        }
+        if self.REASONING_EFFORT is not None:
+            create_kwargs["reasoning_effort"] = self.REASONING_EFFORT
 
-            try:
-                response = self._client.chat.completions.create(**create_kwargs)
-            except openai.BadRequestError as e:
-                error_str = str(e).lower()
-                is_context_error = (
-                    "context" in error_str
-                    or "token" in error_str
-                    or "length" in error_str
-                )
-                if is_context_error and self._trim_oldest_turn():
-                    logger.info(
-                        f"Context overflow: trimmed oldest turn. "
-                        f"Conversation now has {len(self.conversation)} messages."
-                    )
-                    continue
-                raise
+        response = self._client.chat.completions.create(**create_kwargs)
 
-            # Guard against null/empty choices (200 OK but no usable content)
-            if not response.choices:
-                self._save_diagnostic(response)
-                if self._trim_oldest_turn():
-                    logger.warning(
-                        f"Empty choices in response. "
-                        f"Trimmed context to {len(self.conversation)} messages. Retrying."
-                    )
-                    continue
-                raise EmptyResponseError(
-                    f"API returned 200 with empty choices and context cannot be trimmed further. "
-                    f"Diagnostics saved to {self.run_dir}"
-                )
+        if not response.choices:
+            self._save_diagnostic(response)
+            raise EmptyResponseError(
+                f"API returned 200 with empty choices. "
+                f"Diagnostics saved to {self.run_dir}"
+            )
 
-            if response.usage:
-                self.track_tokens(response.usage.total_tokens)
-            return response
+        if response.usage:
+            self.track_tokens(response.usage.total_tokens)
+        return response
 
     def _trim_oldest_turn(self) -> bool:
         """Remove the oldest user/assistant pair, preserving the system message."""
