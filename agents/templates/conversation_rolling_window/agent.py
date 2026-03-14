@@ -179,8 +179,15 @@ class ConversationRollingWindow(Agent):
         """)
 
     def _get_actions(self, latest_frame: FrameData) -> list[GameAction]:
-        """Convert frame's available_actions (list[int]) to GameAction objects."""
-        return [GameAction.from_id(a) for a in latest_frame.available_actions]
+        """Convert frame's available_actions (list[int]) to GameAction objects.
+
+        Always includes RESET so the model can choose to restart the current
+        level even when the game engine does not advertise it.
+        """
+        actions = [GameAction.from_id(a) for a in latest_frame.available_actions]
+        if not any(a.name == "RESET" for a in actions):
+            actions.insert(0, GameAction.RESET)
+        return actions
 
     def _build_available_actions_text(self, actions: list[GameAction]) -> str:
         lines = []
